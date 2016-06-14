@@ -1,4 +1,6 @@
+#mesondefine HAVE_LIBICU
 #mesondefine HAVE_LIBMEDIAART
+#mesondefine HAVE_LIBUNISTRING
 
 #define GETTEXT_PACKAGE "@GETTEXT_PACKAGE@"
 

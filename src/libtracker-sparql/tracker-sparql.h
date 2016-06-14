@@ -24,7 +24,9 @@
 
 #include <libtracker-sparql/tracker-version.h>
 #include <libtracker-sparql/tracker-ontologies.h>
-#include <libtracker-sparql/tracker-generated.h>
+
+/* Generated Vala code */
+#include <tracker-sparql-vala.h>
 
 #undef __LIBTRACKER_SPARQL_INSIDE__
 

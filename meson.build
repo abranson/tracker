@@ -3,6 +3,8 @@
 
 project('tracker', 'c', 'vala', version: '1.8.0')
 
+i18n = import('i18n')
+
 # This is the X.Y used in -llibtracker-FOO-X.Y
 tracker_api_version = '1.0'
 
@@ -38,7 +40,6 @@ libemail_engine = dependency('libemail-engine', required: false)
 libexif = dependency('libexif', version: '> 0.6', required: false)
 libgrss = dependency('libgrss', version: '> 0.7', required: false)
 libgsf = dependency('libgsf-1', version: '> 1.14.24', required: false)
-libicu = dependency('libicu', version: '> 4.8.1.1', required: false)
 libmediaart = dependency('libmediaart', version: '> 1.9.0', required: false)
 libosinfo = dependency('libosinfo', version: '> 0.2.9', required: false)
 libpng = dependency('libpng', version: '> 0.89', required: false)
@@ -67,9 +68,40 @@ libmath = meson.get_compiler('c').find_library('m')
 # to the Vala commandline, but still works as expected for C code.
 uuid = meson.get_compiler('c').find_library('uuid')
 
+# FIXME: allow the user to opt in to libunistring with a commandline arg
+# (if that feature is still useful).
+use_libicu = true
+
+if use_libicu
+    icu_i18n = dependency('icu-i18n', version: '> 4.8.1.1', required: false)
+    icu_uc = dependency('icu-uc', version: '> 4.8.1.1', required: false)
+    unicode_library = [icu_uc, icu_i18n]
+else
+    libunistring = meson.get_compiler('c').find_library('libunistring', required: false)
+    unicode_library = libunistring
+endif
+
+sqlite3_builtin_fts5_test = '''
+    #include <sqlite3.h>
+    sqlite3 *db;
+    int rc;
+    rc = sqlite3_open(":memory:", &db);
+    if (rc!=SQLITE_OK) return -1;
+    rc = sqlite3_exec(db, "create table a(text)", 0, 0, 0);
+    if (rc!=SQLITE_OK) return -1;
+    rc = sqlite3_exec(db, "create virtual table t using fts5(content='a',text)", 0, 0, 0);
+    if (rc!=SQLITE_OK) return -1;
+'''
+
+sqlite3_has_builtin_fts5 = meson.get_compiler('c').compiles(sqlite3_builtin_fts5_test,
+    name: 'sqlite3 has builtin FTS5 module')
+
 conf = configuration_data()
 conf.set('GETTEXT_PACKAGE', 'tracker')
+conf.set('HAVE_BUILTIN_FTS', sqlite3_has_builtin_fts5)
 conf.set('HAVE_LIBMEDIAART', libmediaart.found())
+conf.set('HAVE_LIBICU', true)  # FIXME: shouldn't be hardcoded
+conf.set('HAVE_LIBUNISTRING', false)  # FIXME: shouldn't be hardcoded
 conf.set('LOCALEDIR', get_option('localedir'))
 conf.set('PACKAGE_VERSION', meson.project_version())
 conf.set('TRACKER_UI_DIR', get_option('datadir') + '/tracker/')
@@ -77,12 +109,28 @@ configure_file(input: 'config.h.meson.in',
                output: 'config.h',
                configuration: conf)
 
-gettext('tracker', languages:
+i18n.gettext('tracker', languages:
     ['ar', 'as', 'be@latin', 'bg', 'bs', 'ca', 'ca@valencia', 'cs', 'da', 'de',
      'dz', 'el', 'en_GB', 'eo', 'es', 'et', 'eu', 'fi', 'fr', 'gl', 'he', 'hu',
      'id', 'it', 'ja', 'ko', 'lt', 'lv', 'mk', 'ml', 'nb', 'nds', 'nl', 'oc',
      'pa', 'pl', 'pt', 'pt_BR', 'ro', 'ru', 'sk', 'sl', 'sr', 'sr@latin', 'sv',
      'te', 'tg', 'th', 'tr', 'uk', 'zh_CN', 'zh_HK', 'zh_TW'])
+
+gvdb = static_library(
+    'gvdb',
+    'src/gvdb/gvdb-builder.c',
+    'src/gvdb/gvdb-reader.c',
+    dependencies: [glib],
+    c_args: [
+        '-fPIC',
+    ]
+)
+
+if use_libicu
+    libtracker_common_parser = files('src/libtracker-common/tracker-parser-libicu.c')
+else
+    libtracker_common_parser = files('src/libtracker-common/tracker-parser-libunistring.c')
+endif
 
 libtracker_common = library(
     'tracker-' + tracker_api_version + '/libtracker-common',
@@ -97,8 +145,9 @@ libtracker_common = library(
     'src/libtracker-common/tracker-locale.c',
     'src/libtracker-common/tracker-parser-utils.c',
     'src/libtracker-common/tracker-language.c',
+    libtracker_common_parser,
     # FIXME: need to link against -lkvm on OpenBSD, see configure.ac
-    dependencies: [gio_unix, glib, libmath],
+    dependencies: [gio_unix, glib, libmath, unicode_library],
     c_args: [
         '-DSHAREDIR="' + get_option('datadir') + '"',
         '-DTRACKER_COMPILATION',
@@ -106,21 +155,43 @@ libtracker_common = library(
     ],
 )
 
-libtracker_sparql_intermediate = static_library(
-    'tracker-sparql-' + tracker_api_version,
-    # The .vapi name is taken from the first source file in Meson, so this is
-    # actually a symlink to the real tracker-namespace.vala file.
-    'src/libtracker-sparql/tracker-sparql.vala',
+if sqlite3_has_builtin_fts5
+    libtracker_fts_fts5 = []
+else
+    libtracker_fts_fts5 = files('src/libtracker-fts/fts5.c')
+endif
+
+libtracker_fts = static_library(
+    'libtracker-fts',
+    'src/libtracker-fts/tracker-fts.c',
+    'src/libtracker-fts/tracker-fts-config.c',
+    'src/libtracker-fts/tracker-fts-tokenizer.c',
+    libtracker_fts_fts5,
+    link_with: [libtracker_common],
+    dependencies: [glib, sqlite],
+    c_args: [
+        '-DTRACKER_COMPILATION',
+        '-fPIC',
+        '-I' + meson.source_root() + '/src',
+    ],
+)
+
+
+# The libtracker-sparql Vala code is in a separate library to the C code.
+# This is because the toplevel tracker-sparql.h file exists already and
+# explicitly includes the Vala-generated .h file.
+libtracker_sparql_intermediate_vala = static_library(
+    'tracker-sparql-vala',
+    'src/libtracker-sparql/tracker-namespace.vala',
     'src/libtracker-sparql/tracker-builder.vala',
     'src/libtracker-sparql/tracker-connection.vala',
     'src/libtracker-sparql/tracker-cursor.vala',
     'src/libtracker-sparql/tracker-utils.vala',
-    'src/libtracker-sparql/tracker-uri.c',
-    'src/libtracker-sparql/tracker-version.c',
     link_with: [libtracker_common],
     dependencies: [gio, glib, gobject, uuid],
     c_args: [
         '-DTRACKER_COMPILATION',
+        '-fPIC',
     ],
     vala_args: [
         '--debug',
@@ -131,17 +202,49 @@ libtracker_sparql_intermediate = static_library(
     ],
 )
 
-libtracker_data = library(
-    'tracker-' + tracker_api_version + '/libtracker-data',
-    # The .vapi name is taken from the first source file in Meson
-    'src/libtracker-data/tracker-sparql-query.vala',
+libtracker_sparql_intermediate = static_library(
+    'tracker-sparql-' + tracker_api_version,
+    'src/libtracker-sparql/tracker-uri.c',
+    'src/libtracker-sparql/tracker-version.c',
+    link_with: [libtracker_sparql_intermediate_vala],
+    dependencies: [gio, glib, gobject, uuid],
+    c_args: [
+        '-DTRACKER_COMPILATION',
+    ],
+)
+
+# Vala parts of libtracker-data are split out separately, because we can't link
+# the Vala code to libicu. In the Makefile.am this library is called
+# libtracker-sparql-query.
+libtracker_data_vala = static_library(
+    'libtracker-data-vala',
     'src/libtracker-data/tracker-vala-namespace.vala',
+    'src/libtracker-data/tracker-sparql-query.vala',
     'src/libtracker-data/tracker-sparql-expression.vala',
     'src/libtracker-data/tracker-sparql-pattern.vala',
     'src/libtracker-data/tracker-sparql-scanner.vala',
     'src/libtracker-data/tracker-turtle-reader.vala',
     'src/libtracker-common/libtracker-common.vapi',
     'src/libtracker-data/libtracker-data.vapi',
+    link_with: [libtracker_common, libtracker_sparql_intermediate, libtracker_sparql_intermediate_vala],
+    dependencies: [gio_unix, glib, uuid, zlib],
+    c_args: [
+        '-DSHAREDIR="' + get_option('datadir') + '"',
+        '-DTRACKER_COMPILATION',
+        '-fPIC',
+        '-I' + meson.source_root() + '/src',
+    ],
+    vala_args: [
+        '--debug',
+        '--pkg', 'posix',
+        # FIXME: Meson has code to add --target-glib automatically, but it
+        # doesn't seem to work here.
+        '--target-glib', glib_required,
+    ]
+)
+
+libtracker_data = library(
+    'libtracker-data',
     'src/libtracker-data/tracker-class.c',
     'src/libtracker-data/tracker-collation.c',
     'src/libtracker-data/tracker-crc32.c',
@@ -159,31 +262,24 @@ libtracker_data = library(
     'src/libtracker-data/tracker-ontology.c',
     'src/libtracker-data/tracker-ontologies.c',
     'src/libtracker-data/tracker-property.c',
-    link_with: [libtracker_common, libtracker_sparql_intermediate],
-    dependencies: [gio_unix, glib, sqlite, uuid, zlib],
+    link_with: [gvdb, libtracker_common, libtracker_sparql_intermediate,
+        libtracker_sparql_intermediate_vala, libtracker_data_vala, libtracker_fts],
+    dependencies: [gio_unix, glib, libmath, sqlite, uuid, zlib, unicode_library],
     c_args: [
         '-DSHAREDIR="' + get_option('datadir') + '"',
         '-DTRACKER_COMPILATION',
         '-I' + meson.source_root() + '/src',
     ],
-    vala_args: [
-        '--debug',
-        '--pkg', 'posix',
-        # FIXME: Meson has code to add --target-glib automatically, but it
-        # doesn't seem to work here.
-        '--target-glib', glib_required,
-    ]
 )
-
+#
 libtracker_bus = static_library(
     'tracker-bus',
-    # The .vapi name is taken from the first source file in Meson
     'src/libtracker-bus/tracker-bus.vala',
     'src/libtracker-bus/tracker-namespace.vala',
     'src/libtracker-bus/tracker-array-cursor.vala',
     'src/libtracker-bus/tracker-bus-fd-cursor.vala',
     'src/libtracker-common/libtracker-common.vapi',
-    link_with: [libtracker_common, libtracker_sparql_intermediate],
+    link_with: [libtracker_common, libtracker_sparql_intermediate, libtracker_sparql_intermediate_vala],
     dependencies: [gio, gio_unix],
     c_args: [
         '-DNO_LIBDBUS',
@@ -201,15 +297,18 @@ libtracker_bus = static_library(
 
 libtracker_direct = static_library(
     'tracker-direct',
-    # The .vapi name is taken from the first source file in Meson
     'src/libtracker-direct/tracker-direct.vala',
     'src/libtracker-direct/tracker-namespace.vala',
     'src/libtracker-common/libtracker-common.vapi',
     'src/libtracker-data/libtracker-data.vapi',
     'src/libtracker-data/tracker-sparql-query.vapi',
-    'src/libtracker-sparql/tracker-sparql-' + tracker_api_version + '.vapi',
-    link_with: [libtracker_data, libtracker_sparql_intermediate],
-    dependencies: [gio],
+    link_with: [libtracker_common, libtracker_data,
+        libtracker_sparql_intermediate, libtracker_sparql_intermediate_vala],
+    dependencies: [glib, gio],
+    c_args: [
+        '-DTRACKER_COMPILATION',
+        '-I' + meson.source_root() + '/src',
+    ],
     vala_args: [
         '--debug',
         '--pkg', 'posix',
@@ -222,7 +321,9 @@ libtracker_direct = static_library(
 libtracker_sparql = library(
     'tracker-sparql-' + tracker_api_version,
     'src/libtracker-sparql-backend/tracker-backend.vala',
-    link_with: [libtracker_sparql_intermediate, libtracker_bus, libtracker_direct]
+    'src/libtracker-common/libtracker-common.vapi',
+    link_with: [libtracker_common, libtracker_sparql_intermediate,
+        libtracker_bus, libtracker_direct]
 )
 
 executable(
